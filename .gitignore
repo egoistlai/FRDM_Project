@@ -1,0 +1,12 @@
+cat <<EOF > .gitignore
+# CMake 构建目录
+build/
+
+# VS Code 产生的临时配置文件 (可选)
+.vscode/
+
+# 其他编译产生的临时文件
+*.o
+*.a
+*.so
+EOF
