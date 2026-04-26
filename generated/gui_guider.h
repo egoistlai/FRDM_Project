@@ -28,6 +28,8 @@ typedef struct
 	lv_obj_t *screen_btn_3_label;
 	lv_obj_t *screen_btn_4;
 	lv_obj_t *screen_btn_4_label;
+	lv_obj_t *screen_btn_5;
+	lv_obj_t *screen_btn_5_label;
 	lv_obj_t *screen_vedio;
 	bool screen_vedio_del;
 	lv_obj_t *screen_vedio_img_1;
@@ -67,6 +69,19 @@ typedef struct
 	lv_obj_t *screen_wifi_btn_3;
 	lv_obj_t *screen_wifi_btn_3_label;
 	lv_obj_t *screen_wifi_label_1;
+	lv_obj_t *screen_server;
+	bool screen_server_del;
+	lv_obj_t *screen_server_ta_2;
+	lv_obj_t *screen_server_ta_3;
+	lv_obj_t *screen_server_label_1;
+	lv_obj_t *screen_server_label_2;
+	lv_obj_t *screen_server_btn_1;
+	lv_obj_t *screen_server_btn_1_label;
+	lv_obj_t *screen_server_btn_2;
+	lv_obj_t *screen_server_btn_2_label;
+	lv_obj_t *screen_server_img_1;
+	lv_obj_t *screen_server_btn_3;
+	lv_obj_t *screen_server_btn_3_label;
 	lv_obj_t *g_kb_top_layer;
 }lv_ui;
 
@@ -96,6 +111,7 @@ void setup_scr_screen_vedio(lv_ui *ui);
 void setup_scr_screen_log(lv_ui *ui);
 void setup_scr_screen_settings(lv_ui *ui);
 void setup_scr_screen_wifi(lv_ui *ui);
+void setup_scr_screen_server(lv_ui *ui);
 
 LV_FONT_DECLARE(lv_font_montserratMedium_26)
 LV_FONT_DECLARE(lv_font_montserratMedium_21)

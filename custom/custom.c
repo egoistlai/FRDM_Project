@@ -23,6 +23,8 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
 
 /*********************
  *      DEFINES
@@ -71,6 +73,14 @@ static lv_img_dsc_t cam_img_dsc = {
     .data_size = FRAME_SIZE,
     .data = cam_buf};
 
+// 全局 Socket 变量
+static int server_socket = -1;
+static bool is_transmitting = false;
+static pthread_t tx_thread_id;
+
+// 服务器参数预留
+char target_ip[32] = "100.114.174.61";
+int target_port = 9999;
 
 /**
  * Create a demo application
@@ -324,5 +334,81 @@ void capture_frame()
     else
     {
         printf("[CAM ERROR] 无法写入文件路径\n");
+    }
+}
+
+void *video_tx_thread_func(void *arg)
+{
+    while (is_transmitting && server_socket != -1)
+    {
+        // 等待一帧有效数据 (基于现有的 bytes_read 逻辑)
+        if (cam_buf != NULL)
+        {
+            // 1. 打包数据长度 (与 Python struct.pack("<L", len(data)) 对应)
+            // 注意：当前 cam_buf 是 RGB16 裸数据 (640x480x2 = 614.4 KB)。
+            // 如果网络带宽不足，后期需要在这里引入 libjpeg-turbo 进行压缩。
+            uint32_t data_len = FRAME_SIZE;
+
+            // 发送长度头 (小端序)
+            send(server_socket, &data_len, sizeof(data_len), 0);
+
+            // 发送真实图像数据
+            int total_sent = 0;
+            while (total_sent < FRAME_SIZE && is_transmitting)
+            {
+                int sent = send(server_socket, cam_buf + total_sent, FRAME_SIZE - total_sent, 0);
+                if (sent <= 0)
+                {
+                    printf("[SERVER ERROR] 发送中断\n");
+                    is_transmitting = false;
+                    break;
+                }
+                total_sent += sent;
+            }
+        }
+        // 控制推流帧率 (比如 15fps)，防止挤占过多 CPU 和网络
+        usleep(66000);
+    }
+    return NULL;
+}
+
+void connect_to_server(const char *ip, int port)
+{
+    if (server_socket != -1)
+    {
+        close(server_socket);
+    }
+
+    server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in server_addr;
+    server_addr.sin_family = AF_INET;
+    server_addr.sin_port = htons(port);
+    inet_pton(AF_INET, ip, &server_addr.sin_addr);
+
+    if (connect(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) == 0)
+    {
+        printf("[SERVER SUCCESS] 已连接到服务器!\n");
+        // 这里可以调用 lv_label_set_text 更新 UI 状态
+    }
+    else
+    {
+        printf("[SERVER ERROR] 连接失败!\n");
+        server_socket = -1;
+    }
+}
+
+void toggle_transmission()
+{
+    if (!is_transmitting && server_socket != -1)
+    {
+        is_transmitting = true;
+        pthread_create(&tx_thread_id, NULL, video_tx_thread_func, NULL);
+        pthread_detach(tx_thread_id);
+        printf("[SERVER INFO] 开始推流...\n");
+    }
+    else
+    {
+        is_transmitting = false;
+        printf("[SERVER INFO] 停止推流...\n");
     }
 }

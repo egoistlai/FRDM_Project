@@ -80,6 +80,7 @@ void init_scr_del_flag(lv_ui *ui)
     ui->screen_log_del = true;
     ui->screen_settings_del = true;
     ui->screen_wifi_del = true;
+    ui->screen_server_del = true;
 }
 
 void setup_ui(lv_ui *ui)

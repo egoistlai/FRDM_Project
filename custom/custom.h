@@ -25,6 +25,10 @@ void start_camera(lv_obj_t *img_obj);
 void stop_camera(lv_obj_t *img_obj);
 void capture_frame();
 
+void *video_tx_thread_func(void *arg);
+void connect_to_server(const char *ip, int port);
+void toggle_transmission();
+
 #ifdef __cplusplus
 }
 #endif

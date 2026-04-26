@@ -23,6 +23,7 @@ void events_init_screen_vedio(lv_ui *ui);
 void events_init_screen_log(lv_ui *ui);
 void events_init_screen_settings(lv_ui *ui);
 void events_init_screen_wifi(lv_ui *ui);
+void events_init_screen_server(lv_ui *ui);
 
 #ifdef __cplusplus
 }
