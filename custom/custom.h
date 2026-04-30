@@ -29,6 +29,9 @@ void *video_tx_thread_func(void *arg);
 void connect_to_server(const char *ip, int port);
 void toggle_transmission();
 
+void start_phone_monitor(lv_obj_t *img_obj);
+void *phone_rx_thread_func(void *arg);
+
 #ifdef __cplusplus
 }
 #endif

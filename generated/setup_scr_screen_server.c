@@ -17,6 +17,7 @@
 void setup_scr_screen_server(lv_ui *ui)
 {
     LV_FONT_DECLARE(lv_font_SourceHanSerifSC_Regular_18);
+
     // Write codes screen_server
     ui->screen_server = lv_obj_create(NULL);
     lv_obj_set_size(ui->screen_server, 1024, 600);
@@ -27,7 +28,7 @@ void setup_scr_screen_server(lv_ui *ui)
 
     // Write codes screen_server_ta_2
     ui->screen_server_ta_2 = lv_textarea_create(ui->screen_server);
-    lv_textarea_set_text(ui->screen_server_ta_2, "");
+    lv_textarea_set_text(ui->screen_server_ta_2, "100.114.174.61");
     lv_textarea_set_placeholder_text(ui->screen_server_ta_2, "");
     lv_textarea_set_password_bullet(ui->screen_server_ta_2, "*");
     lv_textarea_set_password_mode(ui->screen_server_ta_2, false);
@@ -67,7 +68,7 @@ void setup_scr_screen_server(lv_ui *ui)
 
     // Write codes screen_server_ta_3
     ui->screen_server_ta_3 = lv_textarea_create(ui->screen_server);
-    lv_textarea_set_text(ui->screen_server_ta_3, "");
+    lv_textarea_set_text(ui->screen_server_ta_3, "9999");
     lv_textarea_set_placeholder_text(ui->screen_server_ta_3, "");
     lv_textarea_set_password_bullet(ui->screen_server_ta_3, "*");
     lv_textarea_set_password_mode(ui->screen_server_ta_3, false);

@@ -294,6 +294,7 @@ static void screen_server_btn_1_event_handler(lv_event_t *e)
 
         // 调用 custom.c 中的连接函数
         connect_to_server(ip, port);
+        start_phone_monitor(guider_ui.screen_server_img_1);
         break;
     }
     default:

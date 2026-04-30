@@ -26,6 +26,7 @@
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
+
 /*********************
  *      DEFINES
  *********************/
@@ -82,6 +83,24 @@ static pthread_t tx_thread_id;
 char target_ip[32] = "100.114.174.61";
 int target_port = 9999;
 
+#define PHONE_WIDTH 480
+#define PHONE_HEIGHT 320
+#define PHONE_SIZE (PHONE_WIDTH * PHONE_HEIGHT * 2)
+
+static uint8_t phone_buf[PHONE_SIZE];
+static lv_img_dsc_t phone_img_dsc = {
+    .header.always_zero = 0,
+    .header.w = PHONE_WIDTH,
+    .header.h = PHONE_HEIGHT,
+    .header.cf = LV_IMG_CF_TRUE_COLOR,
+    .data_size = PHONE_SIZE,
+    .data = phone_buf};
+
+// 全局记录手机画面的 UI 控件指针
+static lv_obj_t *phone_ui_img_ptr = NULL;
+
+static int phone_socket = -1;
+static pthread_t phone_rx_thread_id;
 /**
  * Create a demo application
  */
@@ -160,6 +179,7 @@ void wifi_conn_done_callback(void *result)
     if ((intptr_t)result == 1)
     {
         lv_label_set_text(guider_ui.screen_wifi_label_1, "连接成功!");
+        system("sudo tailscale up &");
     }
     else
     {
@@ -341,32 +361,32 @@ void *video_tx_thread_func(void *arg)
 {
     while (is_transmitting && server_socket != -1)
     {
-        // 等待一帧有效数据 (基于现有的 bytes_read 逻辑)
         if (cam_buf != NULL)
         {
-            // 1. 打包数据长度 (与 Python struct.pack("<L", len(data)) 对应)
-            // 注意：当前 cam_buf 是 RGB16 裸数据 (640x480x2 = 614.4 KB)。
-            // 如果网络带宽不足，后期需要在这里引入 libjpeg-turbo 进行压缩。
             uint32_t data_len = FRAME_SIZE;
 
-            // 发送长度头 (小端序)
-            send(server_socket, &data_len, sizeof(data_len), 0);
+            // 新增打印：确认即将发送的大小
+            printf("[BOARD DEBUG] 准备发送一帧，声明大小: %u bytes\n", data_len);
 
-            // 发送真实图像数据
+            send(server_socket, &data_len, sizeof(data_len), MSG_NOSIGNAL);
+
             int total_sent = 0;
             while (total_sent < FRAME_SIZE && is_transmitting)
             {
-                int sent = send(server_socket, cam_buf + total_sent, FRAME_SIZE - total_sent, 0);
+                int sent = send(server_socket, cam_buf + total_sent, FRAME_SIZE - total_sent, MSG_NOSIGNAL);
                 if (sent <= 0)
                 {
-                    printf("[SERVER ERROR] 发送中断\n");
+                    printf("[SERVER ERROR] 远端已断开，推流停止\n");
                     is_transmitting = false;
+                    close(server_socket);
+                    server_socket = -1;
                     break;
                 }
                 total_sent += sent;
             }
+            // 新增打印：确认实际发送出去的大小
+            printf("[BOARD DEBUG] 成功发送一帧，实际发出: %d bytes\n", total_sent);
         }
-        // 控制推流帧率 (比如 15fps)，防止挤占过多 CPU 和网络
         usleep(66000);
     }
     return NULL;
@@ -379,36 +399,123 @@ void connect_to_server(const char *ip, int port)
         close(server_socket);
     }
 
-    server_socket = socket(AF_INET, SOCK_STREAM, 0);
-    struct sockaddr_in server_addr;
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port = htons(port);
-    inet_pton(AF_INET, ip, &server_addr.sin_addr);
+    // 1. 杀掉后台可能残留的旧进程（注意名字改成了 board_full_client.py）
+    system("pkill -f board_full_client.py");
 
-    if (connect(server_socket, (struct sockaddr *)&server_addr, sizeof(server_addr)) == 0)
+    // 2. 拼装带虚拟环境激活的启动命令
+    // 使用 bash -c 确保 source 指令正常解析，并在最后加上 & 让其在后台运行
+    char cmd[512];
+    snprintf(cmd, sizeof(cmd),
+             "bash -c 'source /home/debian/npu_env/bin/activate && python3 /home/debian/client/board_full_client.py %s %d' &",
+             ip, port);
+
+    printf("[SERVER INFO] 正在启动后台 AI 桥接进程: %s\n", cmd);
+    system(cmd);
+
+    // 3. 给 Python 留出足够的启动时间（加载 NPU 环境和 YOLO 模型可能比较慢，这里延长到 3 秒）
+    usleep(3000000);
+
+    // 4. 连接到本地的 Python 服务端
+    server_socket = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in local_addr;
+    local_addr.sin_family = AF_INET;
+    local_addr.sin_port = htons(8888); // Python 监听的本地端口
+    inet_pton(AF_INET, "127.0.0.1", &local_addr.sin_addr);
+
+    if (connect(server_socket, (struct sockaddr *)&local_addr, sizeof(local_addr)) == 0)
     {
-        printf("[SERVER SUCCESS] 已连接到服务器!\n");
-        // 这里可以调用 lv_label_set_text 更新 UI 状态
+        printf("[SERVER SUCCESS] C 语言已成功连接到本地 AI 中间件!\n");
     }
     else
     {
-        printf("[SERVER ERROR] 连接失败!\n");
+        printf("[SERVER ERROR] 连接本地 Python 失败! 请检查 NPU 虚拟环境或模型加载情况。\n");
         server_socket = -1;
+    }
+
+    phone_socket = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in rx_addr;
+    rx_addr.sin_family = AF_INET;
+    rx_addr.sin_port = htons(8889);
+    inet_pton(AF_INET, "127.0.0.1", &rx_addr.sin_addr);
+
+    if (connect(phone_socket, (struct sockaddr *)&rx_addr, sizeof(rx_addr)) == 0)
+    {
+        printf("[SERVER SUCCESS] 收发双通道均已建立!\n");
+        // 启动接收线程
+        pthread_create(&phone_rx_thread_id, NULL, phone_rx_thread_func, NULL);
+        pthread_detach(phone_rx_thread_id);
     }
 }
 
 void toggle_transmission()
 {
+    if (gst_fd < 0)
+    {
+        printf("[SERVER WARNING] 摄像头未启动！请先打开摄像头画面再推流。\n");
+        return;
+    }
     if (!is_transmitting && server_socket != -1)
     {
         is_transmitting = true;
         pthread_create(&tx_thread_id, NULL, video_tx_thread_func, NULL);
         pthread_detach(tx_thread_id);
-        printf("[SERVER INFO] 开始推流...\n");
+        printf("[SERVER INFO] 开始向本地 AI 节点推流...\n");
     }
     else
     {
         is_transmitting = false;
-        printf("[SERVER INFO] 停止推流...\n");
+        printf("[SERVER INFO] 停止推流，关闭 AI 节点...\n");
+
+        // 【修改这里】停止推流时，杀掉正确的 Python 进程
+        system("pkill -f board_full_client.py");
+        if (server_socket != -1)
+        {
+            close(server_socket);
+            server_socket = -1;
+        }
     }
+}
+
+// 【新增】绑定函数
+void start_phone_monitor(lv_obj_t *img_obj)
+{
+    if (img_obj == NULL)
+        return;
+
+    phone_ui_img_ptr = img_obj;
+    // 将图像控件的数据源设置为我们的接收缓冲区
+    lv_img_set_src(img_obj, &phone_img_dsc);
+    printf("[UI INFO] 手机画面控件绑定成功！\n");
+}
+
+void *phone_rx_thread_func(void *arg)
+{
+    uint32_t bytes_read = 0;
+    while (phone_socket != -1)
+    {
+        // 阻塞接收 Python 传来的 RGB565 裸流
+        int ret = recv(phone_socket, phone_buf + bytes_read, PHONE_SIZE - bytes_read, 0);
+        if (ret > 0)
+        {
+            bytes_read += ret;
+            // 凑齐一帧 320*240*2 = 153600 字节后刷新 UI
+            if (bytes_read >= PHONE_SIZE)
+            {
+                bytes_read = 0;
+                if (phone_ui_img_ptr != NULL)
+                {
+                    lv_img_cache_invalidate_src(&phone_img_dsc);
+                    lv_obj_invalidate(phone_ui_img_ptr);
+                }
+            }
+        }
+        else if (ret <= 0)
+        {
+            printf("[RX ERROR] 手机画面数据流断开\n");
+            close(phone_socket);
+            phone_socket = -1;
+            break;
+        }
+    }
+    return NULL;
 }
