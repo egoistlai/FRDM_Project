@@ -98,18 +98,8 @@ static void screen_vedio_sw_1_event_handler(lv_event_t *e)
         /* 提取在 events_init_screen 中绑定的 ui 结构体指针 */
         lv_ui *ui = (lv_ui *)lv_event_get_user_data(e);
 
-        if (status)
-        {
-            /* 开关处于打开状态：开启摄像头 */
-            start_camera(ui->screen_vedio_img_1);
-        }
-        else
-        {
-            /* 开关处于关闭状态：关闭摄像头，并清除画面残留 */
-            /* 请确保 ui->screen_video_area 与你在 GUI Guider 中设置的容器名称一致。
-               如果不叫 video_area，请修改为对应的 ui->screen_xxxx */
-            stop_camera(ui->screen_vedio_img_1);
-        }
+        toggle_local_render(ui->screen_vedio_img_1, status);
+        
         break;
     }
     default:

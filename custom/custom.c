@@ -25,7 +25,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
-
+#include <sys/time.h>
 
 /*********************
  *      DEFINES
@@ -101,6 +101,14 @@ static lv_obj_t *phone_ui_img_ptr = NULL;
 
 static int phone_socket = -1;
 static pthread_t phone_rx_thread_id;
+
+// ================= 新增防撕裂锁和缓存 =================
+static pthread_mutex_t cam_mutex = PTHREAD_MUTEX_INITIALIZER;
+static uint8_t local_send_buf[FRAME_SIZE]; // 专门用于发送的独立缓存
+static bool is_first_frame_ready = false;
+
+bool is_local_rendering = false;        // 控制是否刷新本地屏幕
+static lv_obj_t *cam_ui_img_ptr = NULL; // 记录屏幕上的图像控件指针
 /**
  * Create a demo application
  */
@@ -108,6 +116,14 @@ static pthread_t phone_rx_thread_id;
 void custom_init(lv_ui *ui)
 {
     /* Add your codes here */
+    // 拦截 Ctrl+C 信号
+    signal(SIGINT, app_cleanup);
+    // 拦截 kill 命令产生的终止信号
+    signal(SIGTERM, app_cleanup);
+    // 拦截网络异常断开可能引发的管道破裂信号 (防止程序意外闪退)
+    signal(SIGPIPE, SIG_IGN);
+
+    start_camera_backend();
 }
 
 void list_item_clicked_event_handler(lv_event_t *e)
@@ -246,8 +262,6 @@ void btn_scan_clicked_event_handler(lv_event_t *e)
 // 定时器回调：高频拉取，低频刷新
 static void cam_refresh_cb(lv_timer_t *timer)
 {
-    lv_obj_t *img_obj = timer->user_data;
-
     if (gst_fd < 0)
         return;
 
@@ -261,38 +275,39 @@ static void cam_refresh_cb(lv_timer_t *timer)
         }
         else
         {
-            break; // 没数据了，立刻退出，不卡死 GUI
+            break;
         }
     }
 
-    // 只有在真正凑齐一帧（614,400字节）时，才消耗 CPU 去重绘屏幕！
     if (bytes_read >= FRAME_SIZE)
     {
+        // 【核心解耦 1】：无论是否渲染，永远给推流端准备最新画面的快照！
+        pthread_mutex_lock(&cam_mutex);
+        memcpy(local_send_buf, cam_buf, FRAME_SIZE);
+        is_first_frame_ready = true;
+        pthread_mutex_unlock(&cam_mutex);
+
         bytes_read = 0;
         debug_frame_count++;
 
-        // 强迫 LVGL 刷新
-        lv_img_cache_invalidate_src(&cam_img_dsc);
-        lv_obj_invalidate(img_obj);
-
-        if (debug_frame_count % 30 == 0)
+        // 【核心解耦 2】：只有当 UI 开关打开时，才消耗 CPU 去重绘屏幕！
+        if (is_local_rendering && cam_ui_img_ptr != NULL)
         {
-            printf("[CAM DEBUG] 流畅渲染第 %d 帧...\n", debug_frame_count);
+            lv_img_cache_invalidate_src(&cam_img_dsc);
+            lv_obj_invalidate(cam_ui_img_ptr);
         }
     }
 }
 
-void start_camera(lv_obj_t *img_obj)
+// 【新函数】：程序一启动就在后台默默打开摄像头硬件
+void start_camera_backend()
 {
     if (gst_fp != NULL)
         return;
 
-    printf("[CAM DEBUG] 准备启动流畅版 GStreamer...\n");
+    printf("[CAM INFO] 正在后台启动摄像头底层流水线...\n");
     bytes_read = 0;
 
-    // 【核心性能优化】
-    // 1. queue: 开启 GStreamer 内部多线程队列缓冲
-    // 2. videorate ! ...framerate=15/1: 强制降为 15 帧，大幅降低总线和 CPU 压力
     const char *cmd = "gst-launch-1.0 -q v4l2src device=/dev/video2 ! "
                       "image/jpeg,width=640,height=480 ! jpegdec ! queue ! "
                       "videoconvert ! video/x-raw,format=RGB16 ! queue ! "
@@ -302,16 +317,13 @@ void start_camera(lv_obj_t *img_obj)
     if (gst_fp)
     {
         gst_fd = fileno(gst_fp);
-
         int flags = fcntl(gst_fd, F_GETFL, 0);
         fcntl(gst_fd, F_SETFL, flags | O_NONBLOCK);
 
-        lv_img_set_src(img_obj, &cam_img_dsc);
-
-        // 【核心性能优化】将接水频率提高到 5ms 一次，消除画面撕裂和等待
+        // 创建定时器，但不依赖任何 UI 控件
         if (cam_timer == NULL)
         {
-            cam_timer = lv_timer_create(cam_refresh_cb, 5, img_obj);
+            cam_timer = lv_timer_create(cam_refresh_cb, 5, NULL);
         }
     }
 }
@@ -332,6 +344,26 @@ void stop_camera(lv_obj_t *img_obj)
     }
 
     lv_img_set_src(img_obj, NULL);
+}
+
+// 【新函数】：仅仅控制是否将画面绘制到屏幕上
+void toggle_local_render(lv_obj_t *img_obj, bool enable)
+{
+    is_local_rendering = enable;
+    cam_ui_img_ptr = img_obj;
+
+    if (enable)
+    {
+        printf("[UI INFO] 已开启开发板本地画面渲染\n");
+        // 挂载数据源
+        lv_img_set_src(img_obj, &cam_img_dsc);
+    }
+    else
+    {
+        printf("[UI INFO] 已关闭开发板本地画面渲染，进入省电模式\n");
+        // 卸载数据源，屏幕画面会变为空白/变黑
+        lv_img_set_src(img_obj, NULL);
+    }
 }
 
 void capture_frame()
@@ -361,22 +393,29 @@ void *video_tx_thread_func(void *arg)
 {
     while (is_transmitting && server_socket != -1)
     {
-        if (cam_buf != NULL)
+        if (is_first_frame_ready)
         {
             uint32_t data_len = FRAME_SIZE;
 
-            // 新增打印：确认即将发送的大小
-            printf("[BOARD DEBUG] 准备发送一帧，声明大小: %u bytes\n", data_len);
+            // 1. 发送帧大小包头
+            int head_sent = send(server_socket, &data_len, sizeof(data_len), MSG_NOSIGNAL);
+            if (head_sent <= 0)
+            {
+                printf("[SERVER ERROR] Python中间件堵塞或断开，推流紧急熔断！\n");
+                is_transmitting = false;
+                close(server_socket);
+                server_socket = -1;
+                break;
+            }
 
-            send(server_socket, &data_len, sizeof(data_len), MSG_NOSIGNAL);
-
+            // 2. 直接发送安全隔离好的 local_send_buf
             int total_sent = 0;
             while (total_sent < FRAME_SIZE && is_transmitting)
             {
-                int sent = send(server_socket, cam_buf + total_sent, FRAME_SIZE - total_sent, MSG_NOSIGNAL);
+                int sent = send(server_socket, local_send_buf + total_sent, FRAME_SIZE - total_sent, MSG_NOSIGNAL);
                 if (sent <= 0)
                 {
-                    printf("[SERVER ERROR] 远端已断开，推流停止\n");
+                    printf("[SERVER ERROR] 画面发送超时，网络拥塞，断开连接！\n");
                     is_transmitting = false;
                     close(server_socket);
                     server_socket = -1;
@@ -384,10 +423,10 @@ void *video_tx_thread_func(void *arg)
                 }
                 total_sent += sent;
             }
-            // 新增打印：确认实际发送出去的大小
-            printf("[BOARD DEBUG] 成功发送一帧，实际发出: %d bytes\n", total_sent);
         }
-        usleep(66000);
+
+        // 推流引擎全开：40000 微秒 = 25 FPS 的检测频率
+        usleep(40000);
     }
     return NULL;
 }
@@ -399,11 +438,8 @@ void connect_to_server(const char *ip, int port)
         close(server_socket);
     }
 
-    // 1. 杀掉后台可能残留的旧进程（注意名字改成了 board_full_client.py）
     system("pkill -f board_full_client.py");
 
-    // 2. 拼装带虚拟环境激活的启动命令
-    // 使用 bash -c 确保 source 指令正常解析，并在最后加上 & 让其在后台运行
     char cmd[512];
     snprintf(cmd, sizeof(cmd),
              "bash -c 'source /home/debian/npu_env/bin/activate && python3 /home/debian/client/board_full_client.py %s %d' &",
@@ -412,23 +448,29 @@ void connect_to_server(const char *ip, int port)
     printf("[SERVER INFO] 正在启动后台 AI 桥接进程: %s\n", cmd);
     system(cmd);
 
-    // 3. 给 Python 留出足够的启动时间（加载 NPU 环境和 YOLO 模型可能比较慢，这里延长到 3 秒）
+    // 等待 Python 启动
     usleep(3000000);
 
-    // 4. 连接到本地的 Python 服务端
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in local_addr;
     local_addr.sin_family = AF_INET;
-    local_addr.sin_port = htons(8888); // Python 监听的本地端口
+    local_addr.sin_port = htons(8888);
     inet_pton(AF_INET, "127.0.0.1", &local_addr.sin_addr);
 
     if (connect(server_socket, (struct sockaddr *)&local_addr, sizeof(local_addr)) == 0)
     {
         printf("[SERVER SUCCESS] C 语言已成功连接到本地 AI 中间件!\n");
+
+        // 【核心修复 2】：为发送通道加上非阻塞“超时锁”
+        // 如果 Python 卡死超过 500 毫秒没收数据，C 语言主动断开报错，绝不陷入死锁！
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 500000;
+        setsockopt(server_socket, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
     }
     else
     {
-        printf("[SERVER ERROR] 连接本地 Python 失败! 请检查 NPU 虚拟环境或模型加载情况。\n");
+        printf("[SERVER ERROR] 连接本地 Python 失败!\n");
         server_socket = -1;
     }
 
@@ -441,7 +483,6 @@ void connect_to_server(const char *ip, int port)
     if (connect(phone_socket, (struct sockaddr *)&rx_addr, sizeof(rx_addr)) == 0)
     {
         printf("[SERVER SUCCESS] 收发双通道均已建立!\n");
-        // 启动接收线程
         pthread_create(&phone_rx_thread_id, NULL, phone_rx_thread_func, NULL);
         pthread_detach(phone_rx_thread_id);
     }
@@ -518,4 +559,38 @@ void *phone_rx_thread_func(void *arg)
         }
     }
     return NULL;
+}
+
+void app_cleanup(int signo)
+{
+    printf("\n[SYSTEM] 收到退出信号 (%d)，正在执行安全清理...\n", signo);
+
+    // 1. 强行关闭摄像头 GStreamer 管道
+    if (gst_fp != NULL)
+    {
+        printf("[SYSTEM] 正在释放摄像头设备节点...\n");
+        // 如果有定时器，为了安全起见不去碰它，直接关底层的管道
+        pclose(gst_fp);
+        gst_fp = NULL;
+        gst_fd = -1;
+    }
+
+    // 2. 关掉所有的 TCP Socket 链接
+    if (server_socket != -1)
+    {
+        close(server_socket);
+        server_socket = -1;
+    }
+    if (phone_socket != -1)
+    {
+        close(phone_socket);
+        phone_socket = -1;
+    }
+
+    // 3. 顺手把后台可能还在跑的 Python AI 进程也斩草除根
+    printf("[SYSTEM] 正在清理后台 Python 桥接进程...\n");
+    system("pkill -f board_full_client.py");
+
+    printf("[SYSTEM] 资源释放完毕，程序安全退出！\n");
+    exit(0); // 彻底结束程序
 }
