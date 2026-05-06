@@ -465,50 +465,82 @@ void connect_to_server(const char *ip, int port)
         close(server_socket);
     if (cmd_socket != -1)
         close(cmd_socket);
+    if (phone_socket != -1)
+        close(phone_socket);
 
     system("pkill -f board_full_client.py");
 
     char cmd[512];
-    // 只传 IP，Python 内部自动连接 9998 和 9999
+    // 启动我们刚重构好的本地路由中间件
     snprintf(cmd, sizeof(cmd),
              "bash -c 'source /home/debian/npu_env/bin/activate && python3 /home/debian/client/board_full_client.py %s' &",
              ip);
 
-    printf("[SERVER INFO] 正在启动后台 AI 桥接进程...\n");
+    printf("[SERVER INFO] 正在启动后台 AI 桥接与路由进程...\n");
     system(cmd);
 
     // 等待 Python 启动并连接远端
     usleep(3000000);
 
-    // 1. 连接视频推流端口 (8888)
+    // ==================================================
+    // 1. 连接视频推流端口 (8888) 并【强制自动推流】
+    // ==================================================
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in local_addr;
     local_addr.sin_family = AF_INET;
     local_addr.sin_port = htons(8888);
     inet_pton(AF_INET, "127.0.0.1", &local_addr.sin_addr);
-    connect(server_socket, (struct sockaddr *)&local_addr, sizeof(local_addr));
 
+    if (connect(server_socket, (struct sockaddr *)&local_addr, sizeof(local_addr)) == 0)
+    {
+        printf("[SERVER SUCCESS] C 语言已成功连接到本地视频总线 (8888)!\n");
+
+        // 【核心修改】：一旦连上 Python，立刻无条件开启底层推流！
+        // 这样 NPU 就能随时拿到最新画面做跌倒检测，而不用等手机端请求
+        is_transmitting = true;
+        pthread_create(&tx_thread_id, NULL, video_tx_thread_func, NULL);
+        pthread_detach(tx_thread_id);
+
+        // 设置防死锁超时锁 (如果 Python 卡住，C 语言不至于死等)
+        struct timeval tv;
+        tv.tv_sec = 0;
+        tv.tv_usec = 500000;
+        setsockopt(server_socket, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+    }
+    else
+    {
+        printf("[SERVER ERROR] 连接本地 Python 失败!\n");
+        server_socket = -1;
+    }
+
+    // ==================================================
     // 2. 连接视频拉流端口 (8889)
+    // ==================================================
     phone_socket = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in rx_addr;
     rx_addr.sin_family = AF_INET;
     rx_addr.sin_port = htons(8889);
     inet_pton(AF_INET, "127.0.0.1", &rx_addr.sin_addr);
+
     if (connect(phone_socket, (struct sockaddr *)&rx_addr, sizeof(rx_addr)) == 0)
     {
         pthread_create(&phone_rx_thread_id, NULL, phone_rx_thread_func, NULL);
         pthread_detach(phone_rx_thread_id);
     }
 
-    // 3. 【新增】连接信令端口 (8890)
+    // ==================================================
+    // 3. 连接信令端口 (8890)
+    // ==================================================
     cmd_socket = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in cmd_addr;
     cmd_addr.sin_family = AF_INET;
     cmd_addr.sin_port = htons(8890);
     inet_pton(AF_INET, "127.0.0.1", &cmd_addr.sin_addr);
+
     if (connect(cmd_socket, (struct sockaddr *)&cmd_addr, sizeof(cmd_addr)) == 0)
     {
-        printf("[SERVER SUCCESS] 信令控制通道建立成功!\n");
+        printf("[SERVER SUCCESS] 本地信令控制通道建立成功!\n");
+        // 保留信令接收线程，为后续（比如接收服务器下发的其他指令）做预留
         pthread_create(&cmd_rx_thread_id, NULL, cmd_rx_thread_func, NULL);
         pthread_detach(cmd_rx_thread_id);
     }
@@ -534,7 +566,16 @@ void set_transmission(bool enable)
 // GUI 按钮的回调仍然可以使用这个（允许开发板端手动覆盖）
 void toggle_transmission()
 {
-    set_transmission(!is_transmitting);
+    // 现在的云端推流由手机 App 控制，C 语言只负责底层数据供应。
+    // 为了防止误触导致底层管线崩溃，我们将此按钮修改为单纯的状态提示。
+    if (is_transmitting)
+    {
+        printf("[SERVER INFO] 底层视频流正在稳定运行中。云端视频是否开启请在手机 App 上操作。\n");
+    }
+    else
+    {
+        printf("[SERVER WARNING] 底层尚未连接服务器，请先点击【连接服务器】。\n");
+    }
 }
 
 // 【新增】绑定函数
