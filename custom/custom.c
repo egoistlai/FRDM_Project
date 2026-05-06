@@ -102,6 +102,9 @@ static lv_obj_t *phone_ui_img_ptr = NULL;
 static int phone_socket = -1;
 static pthread_t phone_rx_thread_id;
 
+static int cmd_socket = -1;
+static pthread_t cmd_rx_thread_id;
+
 // ================= 新增防撕裂锁和缓存 =================
 static pthread_mutex_t cam_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint8_t local_send_buf[FRAME_SIZE]; // 专门用于发送的独立缓存
@@ -431,90 +434,107 @@ void *video_tx_thread_func(void *arg)
     return NULL;
 }
 
+void *cmd_rx_thread_func(void *arg)
+{
+    uint8_t cmd_byte;
+    while (cmd_socket != -1)
+    {
+        int ret = recv(cmd_socket, &cmd_byte, 1, 0);
+        if (ret > 0)
+        {
+            if (cmd_byte == 0x01) {
+                set_transmission(true); // 收到 1，开启推流
+            } else if (cmd_byte == 0x00) {
+                set_transmission(false); // 收到 0，关闭推流
+            }
+        }
+        else if (ret <= 0)
+        {
+            printf("[CMD ERROR] 本地信令通道断开\n");
+            close(cmd_socket);
+            cmd_socket = -1;
+            break;
+        }
+    }
+    return NULL;
+}
+
 void connect_to_server(const char *ip, int port)
 {
     if (server_socket != -1)
-    {
         close(server_socket);
-    }
+    if (cmd_socket != -1)
+        close(cmd_socket);
 
     system("pkill -f board_full_client.py");
 
     char cmd[512];
+    // 只传 IP，Python 内部自动连接 9998 和 9999
     snprintf(cmd, sizeof(cmd),
-             "bash -c 'source /home/debian/npu_env/bin/activate && python3 /home/debian/client/board_full_client.py %s %d' &",
-             ip, port);
+             "bash -c 'source /home/debian/npu_env/bin/activate && python3 /home/debian/client/board_full_client.py %s' &",
+             ip);
 
-    printf("[SERVER INFO] 正在启动后台 AI 桥接进程: %s\n", cmd);
+    printf("[SERVER INFO] 正在启动后台 AI 桥接进程...\n");
     system(cmd);
 
-    // 等待 Python 启动
+    // 等待 Python 启动并连接远端
     usleep(3000000);
 
+    // 1. 连接视频推流端口 (8888)
     server_socket = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in local_addr;
     local_addr.sin_family = AF_INET;
     local_addr.sin_port = htons(8888);
     inet_pton(AF_INET, "127.0.0.1", &local_addr.sin_addr);
+    connect(server_socket, (struct sockaddr *)&local_addr, sizeof(local_addr));
 
-    if (connect(server_socket, (struct sockaddr *)&local_addr, sizeof(local_addr)) == 0)
-    {
-        printf("[SERVER SUCCESS] C 语言已成功连接到本地 AI 中间件!\n");
-
-        // 【核心修复 2】：为发送通道加上非阻塞“超时锁”
-        // 如果 Python 卡死超过 500 毫秒没收数据，C 语言主动断开报错，绝不陷入死锁！
-        struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 500000;
-        setsockopt(server_socket, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
-    }
-    else
-    {
-        printf("[SERVER ERROR] 连接本地 Python 失败!\n");
-        server_socket = -1;
-    }
-
+    // 2. 连接视频拉流端口 (8889)
     phone_socket = socket(AF_INET, SOCK_STREAM, 0);
     struct sockaddr_in rx_addr;
     rx_addr.sin_family = AF_INET;
     rx_addr.sin_port = htons(8889);
     inet_pton(AF_INET, "127.0.0.1", &rx_addr.sin_addr);
-
     if (connect(phone_socket, (struct sockaddr *)&rx_addr, sizeof(rx_addr)) == 0)
     {
-        printf("[SERVER SUCCESS] 收发双通道均已建立!\n");
         pthread_create(&phone_rx_thread_id, NULL, phone_rx_thread_func, NULL);
         pthread_detach(phone_rx_thread_id);
     }
+
+    // 3. 【新增】连接信令端口 (8890)
+    cmd_socket = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in cmd_addr;
+    cmd_addr.sin_family = AF_INET;
+    cmd_addr.sin_port = htons(8890);
+    inet_pton(AF_INET, "127.0.0.1", &cmd_addr.sin_addr);
+    if (connect(cmd_socket, (struct sockaddr *)&cmd_addr, sizeof(cmd_addr)) == 0)
+    {
+        printf("[SERVER SUCCESS] 信令控制通道建立成功!\n");
+        pthread_create(&cmd_rx_thread_id, NULL, cmd_rx_thread_func, NULL);
+        pthread_detach(cmd_rx_thread_id);
+    }
 }
 
-void toggle_transmission()
+void set_transmission(bool enable)
 {
-    if (gst_fd < 0)
-    {
-        printf("[SERVER WARNING] 摄像头未启动！请先打开摄像头画面再推流。\n");
-        return;
-    }
-    if (!is_transmitting && server_socket != -1)
+    if (enable && !is_transmitting && server_socket != -1)
     {
         is_transmitting = true;
         pthread_create(&tx_thread_id, NULL, video_tx_thread_func, NULL);
         pthread_detach(tx_thread_id);
-        printf("[SERVER INFO] 开始向本地 AI 节点推流...\n");
+        printf("[SERVER INFO] 收到手机端指令，已启动高速推流...\n");
     }
-    else
+    else if (!enable && is_transmitting)
     {
         is_transmitting = false;
-        printf("[SERVER INFO] 停止推流，关闭 AI 节点...\n");
-
-        // 【修改这里】停止推流时，杀掉正确的 Python 进程
-        system("pkill -f board_full_client.py");
-        if (server_socket != -1)
-        {
-            close(server_socket);
-            server_socket = -1;
-        }
+        printf("[SERVER INFO] 收到手机端指令，推流已挂起，进入低功耗待机...\n");
+        // 注意：千万不要 close(server_socket)，只是让线程优雅退出，保持 socket 活着！
     }
+}
+
+// GUI 按钮的回调仍然可以使用这个（允许开发板端手动覆盖）
+void toggle_transmission()
+{
+    set_transmission(!is_transmitting);
 }
 
 // 【新增】绑定函数
@@ -529,25 +549,33 @@ void start_phone_monitor(lv_obj_t *img_obj)
     printf("[UI INFO] 手机画面控件绑定成功！\n");
 }
 
+static void refresh_phone_ui_cb(void *arg)
+{
+    if (phone_ui_img_ptr != NULL)
+    {
+        lv_img_cache_invalidate_src(&phone_img_dsc);
+        lv_obj_invalidate(phone_ui_img_ptr);
+    }
+}
+
 void *phone_rx_thread_func(void *arg)
 {
     uint32_t bytes_read = 0;
     while (phone_socket != -1)
     {
         // 阻塞接收 Python 传来的 RGB565 裸流
+        // 这里 recv 限定了最大读取量为 PHONE_SIZE - bytes_read，天然防越界防粘包
         int ret = recv(phone_socket, phone_buf + bytes_read, PHONE_SIZE - bytes_read, 0);
         if (ret > 0)
         {
             bytes_read += ret;
-            // 凑齐一帧 320*240*2 = 153600 字节后刷新 UI
+            // 凑齐一帧完整的画面后
             if (bytes_read >= PHONE_SIZE)
             {
                 bytes_read = 0;
-                if (phone_ui_img_ptr != NULL)
-                {
-                    lv_img_cache_invalidate_src(&phone_img_dsc);
-                    lv_obj_invalidate(phone_ui_img_ptr);
-                }
+                // 【核心修复】：切勿在 pthread 中直接刷新 UI！
+                // 使用 lv_async_call 委托给 LVGL 主线程，保证绝对的线程安全
+                lv_async_call(refresh_phone_ui_cb, NULL);
             }
         }
         else if (ret <= 0)
@@ -576,6 +604,11 @@ void app_cleanup(int signo)
     }
 
     // 2. 关掉所有的 TCP Socket 链接
+    if (cmd_socket != -1)
+    {
+        close(cmd_socket);
+        cmd_socket = -1;
+    }
     if (server_socket != -1)
     {
         close(server_socket);

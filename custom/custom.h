@@ -26,7 +26,9 @@ extern "C"
     void capture_frame();
 
     void *video_tx_thread_func(void *arg);
+    void *cmd_rx_thread_func(void *arg);
     void connect_to_server(const char *ip, int port);
+    void set_transmission(bool enable);
     void toggle_transmission();
 
     void start_phone_monitor(lv_obj_t *img_obj);
